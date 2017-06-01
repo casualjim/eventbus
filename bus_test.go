@@ -3,7 +3,6 @@ package eventbus
 import (
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -68,24 +67,4 @@ func TestPublish_ToAllListeners(t *testing.T) {
 	assert.EqualValues(t, evt, evts[0])
 	assert.EqualValues(t, evt, evts[1])
 	assert.EqualValues(t, evt, evts[2])
-}
-
-func TestPublish_DropFailedListeners(t *testing.T) {
-	bus := New(nil)
-	defer bus.Close()
-	listener1 := make(chan Event)
-	listener2 := make(chan Event)
-	listener3 := make(chan Event)
-	bus.Add(listener1, listener2, listener3)
-	latch := make(chan bool)
-	go func() {
-		time.Sleep(1 * time.Second)
-		latch <- true
-	}()
-
-	evt := Event{Name: "another event"}
-	bus.Broadcaster() <- evt
-	<-latch
-
-	assert.Equal(t, 0, bus.Len())
 }
