@@ -11,20 +11,18 @@ func TestRegisterHandlers(t *testing.T) {
 	bus := New(nil)
 	defer bus.Close()
 	assert.Equal(t, 0, bus.Len())
-	bus.Add(make(chan Event))
+	bus.Subscribe(NOOPHandler)
 	assert.Equal(t, 1, bus.Len())
 }
 
 func TestUnregisterHandlers(t *testing.T) {
 	bus := New(nil)
 	defer bus.Close()
-	h := make(chan Event)
-	h2 := make(chan Event)
-	h3 := make(chan Event)
+
 	assert.Equal(t, 0, bus.Len())
-	bus.Add(h, h2, h3)
+	bus.Subscribe(NOOPHandler, NOOPHandler, NOOPHandler)
 	assert.Equal(t, 3, bus.Len())
-	bus.Remove(h2)
+	bus.Unsubscribe(NOOPHandler)
 	assert.Equal(t, 2, bus.Len())
 }
 
@@ -32,37 +30,43 @@ func TestPublish_ToAllListeners(t *testing.T) {
 	bus := New(nil)
 	defer bus.Close()
 
-	listener1 := make(chan Event)
-	listener2 := make(chan Event)
-	listener3 := make(chan Event)
-	bus.Add(listener1, listener2, listener3)
-
 	evts := make([]Event, 3)
 	wg := new(sync.WaitGroup)
 	wg.Add(3)
-	go func() {
-		var seen int
-		for seen < 3 {
-			select {
-			case e1 := <-listener1:
-				evts[0] = e1
-				wg.Done()
-				seen++
-			case e2 := <-listener2:
-				evts[1] = e2
-				wg.Done()
-				seen++
-			case e3 := <-listener3:
-				evts[2] = e3
-				wg.Done()
-				seen++
-			}
-		}
+	lock := new(sync.Mutex)
+	var seen int
+	listener1 := Handler(func(evt Event) error {
+		lock.Lock()
+		evts[0] = evt
+		seen++
+		lock.Unlock()
 
-	}()
+		wg.Done()
+		return nil
+	})
+	listener2 := Handler(func(evt Event) error {
+		lock.Lock()
+		evts[1] = evt
+		seen++
+		lock.Unlock()
+
+		wg.Done()
+		return nil
+	})
+	listener3 := Handler(func(evt Event) error {
+		lock.Lock()
+		evts[2] = evt
+		seen++
+		lock.Unlock()
+
+		wg.Done()
+		return nil
+	})
+
+	bus.Subscribe(listener1, listener2, listener3)
 
 	evt := Event{Name: "the event"}
-	bus.Broadcaster() <- evt
+	bus.Publish(evt)
 	wg.Wait()
 	assert.EqualValues(t, evt, evts[0])
 	assert.EqualValues(t, evt, evts[1])

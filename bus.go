@@ -1,6 +1,7 @@
 package eventbus
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -15,12 +16,74 @@ type Event struct {
 	Args interface{}
 }
 
+// NOOPHandler drops events on the floor without taking action
+var NOOPHandler = HandlerWithError(func(_ Event) error { return nil }, nil)
+
+type defaultEventHandler struct {
+	on    func(Event) error
+	onErr func(error)
+}
+
+func (h *defaultEventHandler) On(evt Event) error {
+	return h.on(evt)
+}
+
+func (h *defaultEventHandler) OnFailed(err error) {
+	if h.on != nil {
+		h.OnFailed(err)
+	}
+}
+
+func Handler(handler func(Event) error) EventHandler {
+	return HandlerWithError(handler, func(err error) { log.Println(err) })
+}
+
+func HandlerWithError(handler func(Event) error, errorHandler func(error)) EventHandler {
+	return &defaultEventHandler{
+		on:    handler,
+		onErr: errorHandler,
+	}
+}
+
+// EventHander
+type EventHandler interface {
+	On(Event) error
+	OnFailed(error)
+}
+
+type filteredHandler struct {
+	Next    EventHandler
+	Matches EventPredicate
+}
+
+func (f *filteredHandler) On(evt Event) error {
+	if !f.Matches(evt) {
+		return nil
+	}
+	return f.On(evt)
+}
+
+func (f *filteredHandler) OnFailed(err error) {
+	f.OnFailed(err)
+}
+
+// EventPredicate for filtering events
+type EventPredicate func(Event) bool
+
+// Filtered composes an event handler with a filter
+func Filtered(matches EventPredicate, next EventHandler) EventHandler {
+	return &filteredHandler{
+		Matches: matches,
+		Next:    next,
+	}
+}
+
 // EventBus does fanout to registered channels
 type EventBus interface {
 	Close() error
-	Broadcaster() chan<- Event
-	Add(handlers ...chan<- Event)
-	Remove(handlers ...chan<- Event)
+	Publish(Event)
+	Subscribe(...EventHandler)
+	Unsubscribe(...EventHandler)
 	Len() int
 }
 
@@ -28,16 +91,13 @@ type defaultEventBus struct {
 	lock *sync.RWMutex
 
 	channel  chan Event
-	handlers []chan<- Event
+	handlers []EventHandler
 	closing  chan chan struct{}
 	log      logrus.FieldLogger
 }
 
 // New event bus with specified logger
-func New(log logrus.FieldLogger) EventBus { return NewWithTimeout(log, 50*time.Millisecond) }
-
-// NewWithTimeout creates a new event bus with a custom timeout for message delivery
-func NewWithTimeout(log logrus.FieldLogger, timeout time.Duration) EventBus {
+func New(log logrus.FieldLogger) EventBus {
 	if log == nil {
 		log = logrus.New().WithFields(nil)
 	}
@@ -47,11 +107,11 @@ func NewWithTimeout(log logrus.FieldLogger, timeout time.Duration) EventBus {
 		log:     log,
 		lock:    new(sync.RWMutex),
 	}
-	go e.dispatcherLoop(timeout)
+	go e.dispatcherLoop()
 	return e
 }
 
-func (e *defaultEventBus) dispatcherLoop(timeout time.Duration) {
+func (e *defaultEventBus) dispatcherLoop() {
 	totWait := new(sync.WaitGroup)
 	for {
 		select {
@@ -73,9 +133,15 @@ func (e *defaultEventBus) dispatcherLoop(timeout time.Duration) {
 				var wg sync.WaitGroup
 				wg.Add(noh)
 				e.log.Debugf("notifying %d listeners", noh)
-
+				e.log.Debugln(e.handlers)
 				for _, handler := range e.handlers {
-					go e.dispatchEventWithTimeout(handler, timeout, evt, &wg)
+					e.log.Debugln("notifying", handler)
+					go func(handler EventHandler) {
+						if err := handler.On(evt); err != nil {
+							handler.OnFailed(err)
+						}
+						wg.Done()
+					}(handler)
 				}
 
 				wg.Wait()
@@ -84,13 +150,12 @@ func (e *defaultEventBus) dispatcherLoop(timeout time.Duration) {
 			})
 		case closed := <-e.closing:
 			totWait.Wait()
-			close(e.channel)
-			e.lock.RLock()
-			for _, handler := range e.handlers {
-				close(handler)
-			}
+
+			e.lock.Lock()
 			e.handlers = nil
-			e.lock.RUnlock()
+			close(e.channel)
+			e.lock.Unlock()
+
 			closed <- struct{}{}
 			e.log.Debug("event bus closed")
 			return
@@ -99,7 +164,7 @@ func (e *defaultEventBus) dispatcherLoop(timeout time.Duration) {
 }
 
 func (e *defaultEventBus) dispatchEventWithTimeout(channel chan<- Event, timeout time.Duration, event Event, wg *sync.WaitGroup) {
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(timeout) // uses timer so it can be stopped and cleaned up
 	select {
 	case channel <- event:
 		timer.Stop()
@@ -109,38 +174,38 @@ func (e *defaultEventBus) dispatchEventWithTimeout(channel chan<- Event, timeout
 	wg.Done()
 }
 
-func (e *defaultEventBus) Broadcaster() chan<- Event {
-	return e.channel
+// Publish an event to all interested subscribers
+func (e *defaultEventBus) Publish(evt Event) {
+	e.channel <- evt
 }
 
-func (e *defaultEventBus) Add(handler ...chan<- Event) {
+func (e *defaultEventBus) Subscribe(handlers ...EventHandler) {
 	e.lock.Lock()
-	e.log.Debugf("adding %d listeners", len(handler))
-	e.handlers = append(e.handlers, handler...)
+	e.log.Debugf("adding %d listeners", len(handlers))
+	e.handlers = append(e.handlers, handlers...)
 	e.lock.Unlock()
 }
 
-func (e *defaultEventBus) Remove(handler ...chan<- Event) {
-	e.lock.Lock()
-	defer e.lock.Unlock()
+func (e *defaultEventBus) Unsubscribe(handlers ...EventHandler) {
+	e.lock.RLock()
 	if len(e.handlers) == 0 {
-		e.log.Debugf("nothing to remove from", len(handler))
+		e.log.Debugf("nothing to remove from", len(handlers))
+		e.lock.RUnlock()
 		return
 	}
-	e.remove(handler...)
-}
-
-func (e *defaultEventBus) remove(handler ...chan<- Event) {
-	e.log.Debugf("removing %d listeners", len(handler))
-	for _, h := range handler {
+	e.lock.RUnlock()
+	e.lock.Lock()
+	e.log.Debugf("removing %d listeners", len(handlers))
+	for _, h := range handlers {
 		for i, handler := range e.handlers {
 			if h == handler {
-				close(handler)
+				// replace handler because it will still process messages in flight
 				e.handlers = append(e.handlers[:i], e.handlers[i+1:]...)
 				break
 			}
 		}
 	}
+	e.lock.Unlock()
 }
 
 func (e *defaultEventBus) Close() error {
